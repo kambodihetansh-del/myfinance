@@ -796,6 +796,29 @@ body.mv.narrow .kanban-col { flex:0 0 88vw; }
 .view-switch button:hover { color:var(--text); }
 .view-switch button.on { background:var(--bg2); color:var(--accent); }
 }
+
+/* ---------- PIN lock screen ---------- */
+#pin-overlay { position:fixed; inset:0; z-index:9999; background:var(--bg);
+  display:flex; align-items:center; justify-content:center; padding:20px; }
+.pin-box { width:100%; max-width:300px; text-align:center; }
+.pin-logo { font-size:34px; color:var(--accent); font-weight:700; margin-bottom:6px; }
+.pin-title { font-size:17px; font-weight:600; margin-bottom:4px; }
+.pin-sub { font-size:13px; color:var(--text3); margin-bottom:22px; }
+.pin-dots { display:flex; gap:11px; justify-content:center; margin-bottom:28px; min-height:13px; }
+.pin-dots span { width:13px; height:13px; border-radius:50%; border:1.5px solid var(--border2); }
+.pin-dots span.on { background:var(--accent); border-color:var(--accent); }
+.pin-pad { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.pin-pad button { height:60px; border-radius:50%; border:1px solid var(--border);
+  background:var(--bg2); color:var(--text); font-family:'DM Mono',monospace;
+  font-size:21px; cursor:pointer; }
+.pin-pad button:active { background:var(--bg4); }
+.pin-pad button.pin-ghost { background:none; border-color:transparent; color:var(--text3); font-size:17px; }
+.shake { animation:pinShake .32s; }
+@keyframes pinShake {
+  0%,100% { transform:translateX(0); }
+  25% { transform:translateX(-9px); }
+  75% { transform:translateX(9px); }
+}
 </style>
 </head>
 <body>
@@ -1554,6 +1577,18 @@ body.mv.narrow .kanban-col { flex:0 0 88vw; }
       <input type="password" id="set-apikey" placeholder="sk-ant-...">
     </div>
     <button class="btn btn-primary" onclick="saveAPIKey()">Save API Key</button>
+  </div>
+
+  <!-- GOOGLE CALENDAR -->
+  <div class="form-card">
+    <h3>&#128197; Google Calendar</h3>
+    <div id="gcal-settings"></div>
+  </div>
+
+  <!-- PIN LOCK -->
+  <div class="form-card">
+    <h3>&#128274; Screen Lock</h3>
+    <div id="pin-settings"></div>
   </div>
 
   <!-- BACKUP & RESET -->
@@ -2893,6 +2928,10 @@ function loadDB() {
 }
 function saveDB() {
   DB._updatedAt = new Date().toISOString();
+  // The first save that is not part of seeding means the user has started
+  // using this copy for real. Until then it must never be treated as data
+  // worth pushing over what is already in the cloud.
+  if (DB.seedOnly && !window.__seeding) DB.seedOnly = false;
   localStorage.setItem('myfinancecrm', JSON.stringify(DB));
   if (typeof sbQueuePush === 'function') sbQueuePush();   // cloud sync (if logged in)
 }
@@ -3017,7 +3056,9 @@ function showPage(id, el) {
   if (id==='attachments')renderAttachmentsPage();
   if (id==='tasks')      { populateProjectDropdown(); renderTasks(); }
   if (id==='tasktypes')  { renderTaskTypes(); renderMasterData(); }
-  if (id==='myday')      renderMyDay();
+  if (id==='myday')      { renderMyDay();
+                           if (typeof gcalIsConnected === 'function' && gcalIsConnected())
+                             gcalLoadDay(mydayCurrentDate).then(() => renderMyDay()); }
   if (id==='projects')   { renderProjects(); populateAllListSelects(); }
   if (id==='recurring')  renderRecurring();
   if (id==='goals')      renderGoals();
@@ -3030,7 +3071,7 @@ function showPage(id, el) {
   if (id==='invest')     { renderInvestments(); populateAllListSelects(); }
   if (id==='sms')        { populateAccountDropdowns(); populateCategoryDropdown('sms-cat'); }
   if (id==='whatsapp')   {}
-  if (id==='settings')   { renderSettings(); renderResetCounts(); }
+  if (id==='settings')   { renderSettings(); renderResetCounts(); renderPinSettings(); renderGcalSettings(); }
 }
 
 // ============================================================
@@ -3942,6 +3983,7 @@ document.querySelectorAll('.modal-overlay').forEach(o => o.addEventListener('cli
 function seedData() {
   if (DB.noSeed) return;            // cleared on purpose — do not bring demo data back
   if (DB.banks.length > 0) return;
+  DB.seedOnly = true;               // nothing here was entered by the user yet
   DB.categories = [
     {id:'c1',name:'Food',parentId:'',budget:5000,color:'#f97316',active:true},
     {id:'c2',name:'Fuel',parentId:'',budget:3000,color:'#eab308',active:true},
@@ -7405,6 +7447,574 @@ document.addEventListener('click', function (e) {
 });
 window.addEventListener('resize', applyViewMode);
 
+
+// ============================================================
+// PIN LOCK
+//
+// A screen lock so the app cannot be opened by whoever picks the
+// phone up. The PIN is stored on this device only (never synced),
+// as a salted SHA-256 hash — the PIN itself is never written down.
+//
+// Being honest about what this is: it keeps people out of the app,
+// it does not encrypt the stored data. Anyone who knows their way
+// around browser developer tools could still read localStorage.
+// For a personal phone that is the right trade-off; encrypting
+// everything would mean a forgotten PIN destroys the local copy.
+// ============================================================
+
+let pinIdleTimer = null;
+
+function pinIsSet()      { return !!localStorage.getItem('mf_pin_hash'); }
+function pinLockMinutes(){ return parseInt(localStorage.getItem('mf_pin_idle') || '0'); }
+
+async function pinHash(pin, salt) {
+  const text = salt + '|' + pin;
+  if (window.crypto && crypto.subtle && window.isSecureContext) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return 'sha256:' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  // crypto.subtle needs a secure context; opening the file straight from
+  // disk does not always count as one, so fall back to a simple hash
+  let h1 = 0x811c9dc5, h2 = 0x1000193;
+  for (let i = 0; i < text.length; i++) {
+    h1 = Math.imul(h1 ^ text.charCodeAt(i), 16777619) >>> 0;
+    h2 = Math.imul(h2 + text.charCodeAt(i) * (i + 7), 2246822519) >>> 0;
+  }
+  return 'fnv:' + h1.toString(16) + h2.toString(16);
+}
+
+// ---------- the lock screen ----------
+function pinShowLock() {
+  if (document.getElementById('pin-overlay')) return;
+  const el = document.createElement('div');
+  el.id = 'pin-overlay';
+  el.innerHTML = `
+    <div class="pin-box">
+      <div class="pin-logo">&#8377;</div>
+      <div class="pin-title">MyFinance</div>
+      <div class="pin-sub" id="pin-msg">Enter your PIN</div>
+      <div class="pin-dots" id="pin-dots"></div>
+      <div class="pin-pad">
+        ${[1,2,3,4,5,6,7,8,9].map(n => `<button onclick="pinType('${n}')">${n}</button>`).join('')}
+        <button class="pin-ghost" onclick="pinForgot()">?</button>
+        <button onclick="pinType('0')">0</button>
+        <button class="pin-ghost" onclick="pinBack()">&#9003;</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  el._entry = '';
+  pinPaintDots();
+
+  el._key = e => {
+    if (/^[0-9]$/.test(e.key)) pinType(e.key);
+    else if (e.key === 'Backspace') pinBack();
+  };
+  document.addEventListener('keydown', el._key);
+}
+
+function pinPaintDots() {
+  const el = document.getElementById('pin-overlay');
+  const dots = document.getElementById('pin-dots');
+  if (!el || !dots) return;
+  const n = (el._entry || '').length;
+  dots.innerHTML = Array.from({ length: Math.max(4, n) },
+    (_, i) => `<span class="${i < n ? 'on' : ''}"></span>`).join('');
+}
+
+function pinType(d) {
+  const el = document.getElementById('pin-overlay');
+  if (!el) return;
+  el._entry = (el._entry || '') + d;
+  pinPaintDots();
+  if (el._entry.length >= 4) pinTryUnlock();
+}
+
+function pinBack() {
+  const el = document.getElementById('pin-overlay');
+  if (!el) return;
+  el._entry = (el._entry || '').slice(0, -1);
+  pinPaintDots();
+}
+
+async function pinTryUnlock() {
+  const el = document.getElementById('pin-overlay');
+  const msg = document.getElementById('pin-msg');
+  const entry = el._entry || '';
+  const salt = localStorage.getItem('mf_pin_salt') || '';
+  const want = localStorage.getItem('mf_pin_hash') || '';
+  const got = await pinHash(entry, salt);
+
+  if (got === want) {
+    document.removeEventListener('keydown', el._key);
+    el.remove();
+    document.body.style.overflow = '';
+    sessionStorage.removeItem('mf_pin_tries');
+    pinResetIdle();
+    return;
+  }
+
+  const tries = parseInt(sessionStorage.getItem('mf_pin_tries') || '0') + 1;
+  sessionStorage.setItem('mf_pin_tries', String(tries));
+  el._entry = '';
+  pinPaintDots();
+  const box = el.querySelector('.pin-box');
+  box.classList.remove('shake');
+  void box.offsetWidth;
+  box.classList.add('shake');
+  msg.textContent = tries >= 5 ? 'Still wrong — tap ? if you have forgotten it' : 'Wrong PIN, try again';
+  msg.style.color = 'var(--red)';
+}
+
+function pinForgot() {
+  const cloud = (typeof SB_USER !== 'undefined' && SB_USER) || localStorage.getItem('mf_sb_url');
+  alert(
+    'Forgotten your PIN?\n\n' +
+    'The PIN is stored on this device only, so it cannot be looked up or reset from here.\n\n' +
+    'Clear this site\'s data in your browser settings. That removes the PIN — and the copy of ' +
+    'your records held on this device.\n\n' +
+    (cloud
+      ? 'Cloud sync is set up, so your records are safe. Log in again afterwards and use ' +
+        '"Download From Cloud" to get everything back.'
+      : 'Cloud sync is NOT set up on this device, so make sure you have a backup file first ' +
+        '(Settings → Download Backup) or those records will be gone.')
+  );
+}
+
+// ---------- idle re-lock ----------
+function pinResetIdle() {
+  clearTimeout(pinIdleTimer);
+  const mins = pinLockMinutes();
+  if (!pinIsSet() || !mins) return;
+  pinIdleTimer = setTimeout(() => pinShowLock(), mins * 60 * 1000);
+}
+
+// ---------- settings ----------
+async function pinSave() {
+  const a = (document.getElementById('pin-new') || {}).value || '';
+  const b = (document.getElementById('pin-confirm') || {}).value || '';
+  const say = (m, c) => {
+    const el = document.getElementById('pin-status');
+    if (el) { el.textContent = m; el.style.color = c || 'var(--text2)'; }
+  };
+
+  if (pinIsSet()) {
+    const cur = (document.getElementById('pin-current') || {}).value || '';
+    const got = await pinHash(cur, localStorage.getItem('mf_pin_salt') || '');
+    if (got !== localStorage.getItem('mf_pin_hash')) { say('Current PIN is wrong.', 'var(--red)'); return; }
+  }
+  if (!/^\d{4,8}$/.test(a)) { say('Use 4 to 8 digits.', 'var(--red)'); return; }
+  if (a !== b) { say('The two PINs do not match.', 'var(--red)'); return; }
+
+  const salt = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  localStorage.setItem('mf_pin_salt', salt);
+  localStorage.setItem('mf_pin_hash', await pinHash(a, salt));
+  renderPinSettings();
+  say('PIN saved. It will be asked for the next time the app opens.', 'var(--green)');
+  pinResetIdle();
+}
+
+async function pinRemove() {
+  const say = (m, c) => {
+    const el = document.getElementById('pin-status');
+    if (el) { el.textContent = m; el.style.color = c || 'var(--text2)'; }
+  };
+  const cur = (document.getElementById('pin-current') || {}).value || '';
+  const got = await pinHash(cur, localStorage.getItem('mf_pin_salt') || '');
+  if (got !== localStorage.getItem('mf_pin_hash')) { say('Enter your current PIN first.', 'var(--red)'); return; }
+  if (!confirm('Remove the PIN?\n\nAnyone who opens the app on this device will see your records.')) return;
+  localStorage.removeItem('mf_pin_hash');
+  localStorage.removeItem('mf_pin_salt');
+  clearTimeout(pinIdleTimer);
+  renderPinSettings();
+  say('PIN removed.');
+}
+
+function pinSetIdle(v) {
+  localStorage.setItem('mf_pin_idle', v);
+  pinResetIdle();
+}
+
+function renderPinSettings() {
+  const wrap = document.getElementById('pin-settings');
+  if (!wrap) return;
+  const on = pinIsSet();
+  wrap.innerHTML = `
+    <div style="font-size:13px;color:var(--text3);margin-bottom:14px;line-height:1.6;">
+      ${on
+        ? 'A PIN is set on this device. It is asked for every time the app opens.'
+        : 'Set a PIN so the app cannot be opened by anyone who picks up this device.'}
+      The PIN is kept on this device only &mdash; it is not synced, and it is stored as a
+      one-way hash rather than as the number itself.
+    </div>
+    <div class="form-grid">
+      ${on ? `<div class="form-group"><label>Current PIN</label>
+        <input type="password" id="pin-current" inputmode="numeric" maxlength="8" placeholder="&bull;&bull;&bull;&bull;"></div>` : ''}
+      <div class="form-group"><label>${on ? 'New PIN' : 'PIN'} <span style="color:var(--text3);font-weight:400;">(4&ndash;8 digits)</span></label>
+        <input type="password" id="pin-new" inputmode="numeric" maxlength="8" placeholder="&bull;&bull;&bull;&bull;"></div>
+      <div class="form-group"><label>Repeat it</label>
+        <input type="password" id="pin-confirm" inputmode="numeric" maxlength="8" placeholder="&bull;&bull;&bull;&bull;"></div>
+    </div>
+    <div class="form-group" style="margin-top:12px;max-width:280px;">
+      <label>Also lock after being idle</label>
+      <select id="pin-idle" onchange="pinSetIdle(this.value)">
+        <option value="0">Only when the app opens</option>
+        <option value="1">After 1 minute</option>
+        <option value="5">After 5 minutes</option>
+        <option value="15">After 15 minutes</option>
+        <option value="60">After 1 hour</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;">
+      <button class="btn btn-primary" onclick="pinSave()">${on ? 'Change PIN' : 'Set PIN'}</button>
+      ${on ? `<button class="btn btn-danger" onclick="pinRemove()">Remove PIN</button>` : ''}
+      ${on ? `<button class="btn btn-ghost" onclick="pinShowLock()">Lock Now</button>` : ''}
+    </div>
+    <div id="pin-status" style="font-size:13px;color:var(--text2);margin-top:12px;"></div>`;
+  const sel = document.getElementById('pin-idle');
+  if (sel) sel.value = String(pinLockMinutes());
+}
+
+// ---------- boot ----------
+function pinBoot() {
+  if (pinIsSet()) pinShowLock();
+  ['click', 'keydown', 'touchstart'].forEach(ev =>
+    document.addEventListener(ev, pinResetIdle, { passive: true }));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && pinIsSet() && pinLockMinutes()) pinResetIdle();
+  });
+  pinResetIdle();
+}
+
+
+// ============================================================
+// GOOGLE CALENDAR — real two-way link
+//
+// Uses Google Identity Services for sign-in and the Calendar API
+// directly. Nothing is stored on any server of ours: the access
+// token lives in memory for the session only, and the Client ID
+// sits in this browser.
+//
+// Google hands out an access token that expires after about an
+// hour. There is no refresh token in this flow (that would need a
+// server), so when a call comes back 401 the token is quietly
+// requested again rather than throwing the user out.
+// ============================================================
+
+const GCAL_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+let gcalToken = null;          // { value, expiresAt }
+let gcalTokenClient = null;
+let gcalLibReady = false;
+
+function gcalClientId() { return (localStorage.getItem('mf_gcal_id') || '').trim(); }
+function gcalIsConnected() { return !!(gcalToken && gcalToken.value && Date.now() < gcalToken.expiresAt); }
+
+function gcalSay(msg, colour) {
+  const el = document.getElementById('gcal-status');
+  if (el) { el.textContent = msg; el.style.color = colour || 'var(--text2)'; }
+}
+
+// ---------- library ----------
+function gcalLoadLib() {
+  return new Promise((resolve, reject) => {
+    if (gcalLibReady && window.google && google.accounts) return resolve();
+    if (document.getElementById('gsi-lib')) {
+      const wait = setInterval(() => {
+        if (window.google && google.accounts) { clearInterval(wait); gcalLibReady = true; resolve(); }
+      }, 100);
+      setTimeout(() => { clearInterval(wait); reject(new Error('Google sign-in did not load')); }, 8000);
+      return;
+    }
+    const s = document.createElement('script');
+    s.id = 'gsi-lib';
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.onload = () => { gcalLibReady = true; resolve(); };
+    s.onerror = () => reject(new Error('Could not reach Google (check your internet or ad blocker)'));
+    document.head.appendChild(s);
+  });
+}
+
+// ---------- connecting ----------
+async function gcalConnect(silent) {
+  const id = gcalClientId();
+  if (!id) { gcalSay('Enter your Google Client ID first.', 'var(--red)'); return false; }
+
+  try { await gcalLoadLib(); }
+  catch (e) { gcalSay(e.message, 'var(--red)'); return false; }
+
+  return new Promise(resolve => {
+    try {
+      gcalTokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: id,
+        scope: GCAL_SCOPE,
+        callback: resp => {
+          if (resp.error) {
+            gcalSay('Google refused the sign-in: ' + resp.error, 'var(--red)');
+            resolve(false);
+            return;
+          }
+          gcalToken = {
+            value: resp.access_token,
+            expiresAt: Date.now() + ((parseInt(resp.expires_in) || 3600) - 60) * 1000
+          };
+          renderGcalSettings();
+          gcalSay('Connected to Google Calendar.', 'var(--green)');
+          resolve(true);
+        }
+      });
+      // 'none' tries without showing the account chooser again
+      gcalTokenClient.requestAccessToken({ prompt: silent ? 'none' : '' });
+    } catch (e) {
+      gcalSay('Could not start sign-in: ' + e.message, 'var(--red)');
+      resolve(false);
+    }
+  });
+}
+
+function gcalDisconnect() {
+  if (gcalToken && window.google && google.accounts && google.accounts.oauth2) {
+    try { google.accounts.oauth2.revoke(gcalToken.value, () => {}); } catch (e) {}
+  }
+  gcalToken = null;
+  renderGcalSettings();
+  gcalSay('Disconnected. Nothing will be read from or written to your calendar.', 'var(--text2)');
+}
+
+function gcalSaveClientId() {
+  const v = (document.getElementById('gcal-client-id') || {}).value.trim();
+  if (v && !/\.apps\.googleusercontent\.com$/.test(v)) {
+    gcalSay('That does not look like a Client ID — it should end in .apps.googleusercontent.com', 'var(--red)');
+    return;
+  }
+  localStorage.setItem('mf_gcal_id', v);
+  gcalToken = null;
+  // repaint first — renderGcalSettings() rebuilds the panel, which would
+  // wipe the message if it were set beforehand
+  renderGcalSettings();
+  gcalSay(v ? 'Saved. Now press Connect.' : 'Client ID cleared.', 'var(--green)');
+}
+
+// ---------- API ----------
+async function gcalFetch(path, opts) {
+  if (!gcalIsConnected()) {
+    const ok = await gcalConnect(true);
+    if (!ok) throw new Error('Not connected to Google Calendar');
+  }
+  const res = await fetch('https://www.googleapis.com/calendar/v3' + path, {
+    ...opts,
+    headers: {
+      Authorization: 'Bearer ' + gcalToken.value,
+      'Content-Type': 'application/json',
+      ...(opts && opts.headers)
+    }
+  });
+  if (res.status === 401) {          // token went stale — ask for a new one once
+    gcalToken = null;
+    const ok = await gcalConnect(true);
+    if (!ok) throw new Error('Google sign-in expired. Press Connect again.');
+    return gcalFetch(path, opts);
+  }
+  if (!res.ok) {
+    let msg = res.status + ' ' + res.statusText;
+    try { const j = await res.json(); if (j.error && j.error.message) msg = j.error.message; } catch (e) {}
+    throw new Error(msg);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+// Events for one day, timed ones only (all-day entries have no start.dateTime)
+async function gcalEventsForDay(dateStr) {
+  const from = new Date(dateStr + 'T00:00:00');
+  const to = new Date(dateStr + 'T23:59:59');
+  const q = '/calendars/primary/events'
+    + '?timeMin=' + encodeURIComponent(from.toISOString())
+    + '&timeMax=' + encodeURIComponent(to.toISOString())
+    + '&singleEvents=true&orderBy=startTime&maxResults=50';
+  const data = await gcalFetch(q);
+  return (data.items || [])
+    .filter(e => e.start && e.start.dateTime && e.status !== 'cancelled')
+    .map(e => ({
+      id: e.id,
+      title: e.summary || '(no title)',
+      start: new Date(e.start.dateTime),
+      end: new Date(e.end.dateTime),
+      location: e.location || '',
+      link: e.htmlLink || ''
+    }));
+}
+
+function gcalHHMM(d) {
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+// ---------- cache, so My Day does not call Google on every repaint ----------
+let gcalDayCache = { date: null, events: [], at: 0 };
+
+async function gcalLoadDay(dateStr, force) {
+  if (!gcalIsConnected()) return [];
+  if (!force && gcalDayCache.date === dateStr && Date.now() - gcalDayCache.at < 60000) {
+    return gcalDayCache.events;
+  }
+  try {
+    const events = await gcalEventsForDay(dateStr);
+    gcalDayCache = { date: dateStr, events, at: Date.now() };
+    return events;
+  } catch (e) {
+    console.warn('Calendar fetch failed:', e.message);
+    return [];
+  }
+}
+
+function getGcalProposals(dateStr) {
+  if (gcalDayCache.date !== dateStr) return [];
+  const taken = new Set(getDayEntries(dateStr).map(e => e.gcalId).filter(Boolean));
+  return gcalDayCache.events.filter(e => !taken.has(e.id));
+}
+
+// Put a Google event on the My Day timeline
+function acceptGcalEvent(eventId) {
+  const ev = (gcalDayCache.events || []).find(e => e.id === eventId);
+  if (!ev) return;
+  const day = getMyDay(mydayCurrentDate);
+  day.entries.push({
+    id: 'e' + Date.now().toString(36),
+    start: gcalHHMM(ev.start),
+    end: gcalHHMM(ev.end),
+    text: ev.title,
+    cat: 'productive',
+    subCat: '',
+    block: 'work',
+    taskId: '',
+    gcalId: ev.id
+  });
+  saveDB();
+  logActivity('My Day', 'Added "' + ev.title + '" from Google Calendar');
+  renderMyDay();
+}
+
+async function acceptAllGcal() {
+  const list = getGcalProposals(mydayCurrentDate);
+  if (!list.length) return;
+  if (!confirm('Add all ' + list.length + ' calendar event' + (list.length === 1 ? '' : 's') +
+               ' to this day\'s timeline?')) return;
+  list.forEach(ev => {
+    getMyDay(mydayCurrentDate).entries.push({
+      id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+      start: gcalHHMM(ev.start), end: gcalHHMM(ev.end),
+      text: ev.title, cat: 'productive', subCat: '', block: 'work', taskId: '', gcalId: ev.id
+    });
+  });
+  saveDB();
+  renderMyDay();
+}
+
+// ---------- pushing to Google ----------
+async function pushTaskToGcal(taskId) {
+  const t = (DB.tasks || []).find(x => x.id === taskId);
+  if (!t) return;
+  if (!t.dueDate) { alert('Give the task a due date first.'); return; }
+
+  const time = t.dueTime || '09:00';
+  const mins = parseInt(t.duration) || 60;
+  const start = new Date(t.dueDate + 'T' + time + ':00');
+  const end = new Date(start.getTime() + mins * 60000);
+
+  try {
+    const body = {
+      summary: t.title,
+      description: (t.desc || '') + '\n\nFrom MyFinance',
+      start: { dateTime: start.toISOString() },
+      end: { dateTime: end.toISOString() }
+    };
+    let ev;
+    if (t.gcalId) {
+      ev = await gcalFetch('/calendars/primary/events/' + t.gcalId,
+        { method: 'PATCH', body: JSON.stringify(body) });
+    } else {
+      ev = await gcalFetch('/calendars/primary/events',
+        { method: 'POST', body: JSON.stringify(body) });
+      t.gcalId = ev.id;
+      saveDB();
+    }
+    gcalDayCache.at = 0;
+    alert('"' + t.title + '" is now in your Google Calendar at ' + fmtTime(time) + '.');
+    logActivity('Calendar', 'Sent "' + t.title + '" to Google');
+  } catch (e) {
+    alert('Could not add it to Google Calendar:\n\n' + e.message);
+  }
+}
+
+async function pushAllTasksToGcal() {
+  const list = (DB.tasks || []).filter(t =>
+    t.dueDate && t.dueTime && t.status !== 'done' && t.status !== 'cancelled');
+  if (!list.length) { alert('No tasks have both a date and a time set.'); return; }
+  if (!confirm('Send ' + list.length + ' task' + (list.length === 1 ? '' : 's') +
+               ' to Google Calendar?\n\nOnes already sent are updated rather than duplicated.')) return;
+
+  let done = 0, failed = 0;
+  for (const t of list) {
+    try { await pushTaskToGcalQuiet(t); done++; } catch (e) { failed++; }
+  }
+  saveDB();
+  alert(done + ' sent' + (failed ? ', ' + failed + ' failed' : '') + '.');
+}
+
+async function pushTaskToGcalQuiet(t) {
+  const time = t.dueTime || '09:00';
+  const mins = parseInt(t.duration) || 60;
+  const start = new Date(t.dueDate + 'T' + time + ':00');
+  const end = new Date(start.getTime() + mins * 60000);
+  const body = {
+    summary: t.title,
+    description: (t.desc || '') + '\n\nFrom MyFinance',
+    start: { dateTime: start.toISOString() },
+    end: { dateTime: end.toISOString() }
+  };
+  if (t.gcalId) {
+    await gcalFetch('/calendars/primary/events/' + t.gcalId, { method: 'PATCH', body: JSON.stringify(body) });
+  } else {
+    const ev = await gcalFetch('/calendars/primary/events', { method: 'POST', body: JSON.stringify(body) });
+    t.gcalId = ev.id;
+  }
+}
+
+// ---------- settings panel ----------
+function renderGcalSettings() {
+  const wrap = document.getElementById('gcal-settings');
+  if (!wrap) return;
+  const id = gcalClientId();
+  const on = gcalIsConnected();
+
+  wrap.innerHTML = `
+    <div style="font-size:13px;color:var(--text3);margin-bottom:14px;line-height:1.7;">
+      Connect your own Google account so calendar events show up in My Day and tasks can be
+      sent the other way. You need a Google Cloud Client ID for this &mdash; the setup guide
+      walks through it. Nothing is stored outside this browser and your own Google account.
+    </div>
+
+    <div class="form-group" style="max-width:560px;">
+      <label>Google OAuth Client ID</label>
+      <input type="text" id="gcal-client-id" placeholder="1234567890-abcdef.apps.googleusercontent.com" value="${escHtml(id)}">
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+      <button class="btn btn-ghost" onclick="gcalSaveClientId()">Save Client ID</button>
+      ${on
+        ? `<button class="btn btn-danger" onclick="gcalDisconnect()">Disconnect</button>`
+        : `<button class="btn btn-primary" onclick="gcalConnect(false)">Connect to Google</button>`}
+      ${on ? `<button class="btn btn-ghost" onclick="pushAllTasksToGcal()">Send All Timed Tasks</button>` : ''}
+    </div>
+
+    <div style="margin-top:14px;padding:12px 14px;background:var(--bg3);border-radius:var(--radius-sm);
+                font-size:12.5px;color:var(--text2);line-height:1.7;">
+      <strong>${on ? '&#9679; Connected' : '&#9675; Not connected'}</strong><br>
+      ${on
+        ? 'Open My Day and today\'s events will appear at the top, ready to add to your timeline.'
+        : 'Once connected, your calendar events appear in My Day and can be added with one tap.'}
+    </div>
+    <div id="gcal-status" style="font-size:13px;color:var(--text2);margin-top:12px;"></div>`;
+}
+
 function ensureMyDayStore() {
   if (!DB.myDays) DB.myDays = {};
 }
@@ -7638,6 +8248,30 @@ function renderMyDay() {
   const proposed = getProposedTasks(mydayCurrentDate);
   const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
 
+  // --- events sitting in Google Calendar for this day ---
+  const gcalList = getGcalProposals(mydayCurrentDate);
+  let gcalHtml = '';
+  if (gcalList.length) {
+    gcalHtml = `
+      <div class="myday-section" style="border-color:var(--green);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <h3 style="margin:0;">&#128197; From Google Calendar (${gcalList.length})</h3>
+          <button class="btn btn-ghost" style="padding:5px 11px;font-size:12px;" onclick="acceptAllGcal()">Add all</button>
+        </div>
+        ${gcalList.map(ev => `
+          <div class="myday-proposed">
+            <div class="pt-time" style="color:var(--green);">${fmtTime(gcalHHMM(ev.start))}</div>
+            <div class="pt-body">
+              <div class="pt-title">${escHtml(ev.title)}</div>
+              <div class="pt-meta">${fmtDuration(Math.round((ev.end - ev.start) / 60000))}${ev.location ? ' &middot; ' + escHtml(ev.location) : ''}</div>
+            </div>
+            <div class="pt-actions">
+              <button class="btn btn-primary" style="padding:5px 12px;font-size:12px;" onclick="acceptGcalEvent('${ev.id}')">Add</button>
+            </div>
+          </div>`).join('')}
+      </div>`;
+  }
+
   // --- suggestions from timed tasks ---
   let proposedHtml = '';
   if (proposed.length) {
@@ -7768,6 +8402,7 @@ function renderMyDay() {
 
     ${blockChips ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">${blockChips}</div>` : ''}
 
+    ${gcalHtml}
     ${proposedHtml}
 
     <div class="myday-section">
@@ -9591,7 +10226,7 @@ function checkRecurringOnLoad() {
   }
 }
 
-loadDB(); seedData(); seedTasks(); seedTaskTypes(); migrateNestedTasks(); seedInvestments(); seedProjects(); populateAccountDropdowns(); populateProjectDropdown(); populateTaskTypeDropdowns(); ensureLists(); ensureTaskCols(); populateAllListSelects(); applyViewMode();
+loadDB(); window.__seeding = true; seedData(); seedTasks(); seedTaskTypes(); migrateNestedTasks(); seedInvestments(); seedProjects(); window.__seeding = false; populateAccountDropdowns(); populateProjectDropdown(); populateTaskTypeDropdowns(); ensureLists(); ensureTaskCols(); populateAllListSelects(); applyViewMode(); pinBoot();
 initTheme();
 document.getElementById('dash-date').textContent = new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
 dashFilter = { from: null, to: null, preset: 'this_month' };
@@ -9779,7 +10414,16 @@ async function sbLogOut() {
 }
 
 // ---------- is the local copy just seed data? ----------
+// "Is there anything here worth keeping?"
+//
+// A brand new copy of the app is not blank — it seeds sample banks,
+// categories, income and expenses so there is something to look at.
+// Counting rows therefore says "not empty" on a fresh install, which
+// once caused a fresh copy to be pushed over real data in the cloud.
+// DB.seedOnly stays true until the first genuine save, so it is the
+// only reliable signal.
 function sbLocalIsEmpty() {
+  if (DB && DB.seedOnly) return true;
   const n = k => ((DB && DB[k]) || []).length;
   return n('expenses') === 0 && n('income') === 0 && n('transfers') === 0 &&
          n('cashTx')   === 0 && n('tasks')  === 0 && n('goals')     === 0 &&
