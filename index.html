@@ -10445,6 +10445,7 @@ async function sbPush() {
   if (!SB || !SB_USER) return false;
   const stamp = new Date().toISOString();
   DB._updatedAt = stamp;
+  DB.seedOnly = false;          // anything worth uploading is real data
   const { error } = await SB.from('finance_data').upsert({
     user_id: SB_USER.id,
     data: DB,
@@ -10459,6 +10460,11 @@ function sbApplyCloud(row) {
   // keep a rollback copy before overwriting anything
   localStorage.setItem('myfinancecrm_prev', localStorage.getItem('myfinancecrm') || '');
   DB = row.data;
+  // Whatever arrives from the cloud is now this device's working copy, so it
+  // must not still be flagged as untouched seed data. Leaving that flag set
+  // made the app decide it was empty on the next load, download again, and
+  // reload — over and over, which showed up as the page flickering.
+  DB.seedOnly = false;
   localStorage.setItem('myfinancecrm', JSON.stringify(DB));
   location.reload();
 }
@@ -10478,6 +10484,18 @@ function sbNice(ts) {
 
 // ---------- decide what to do when a session starts ----------
 async function sbSyncOnLogin() {
+  // A download triggers a page reload, so a bad decision could bounce the
+  // app between reloads forever. Three downloads in one minute means
+  // something is wrong — stop and say so rather than spin.
+  const marks = JSON.parse(sessionStorage.getItem('mf_sync_reloads') || '[]')
+    .filter(t => Date.now() - t < 60000);
+  if (marks.length >= 3) {
+    sessionStorage.removeItem('mf_sync_reloads');
+    sbSetStatus('Sync kept restarting, so it has been stopped. Use Upload Now or ' +
+                'Download From Cloud by hand to settle which copy to keep.', 'var(--red)');
+    return;
+  }
+
   try {
     sbSetStatus('Checking cloud…');
     const cloud = await sbPull();
@@ -10489,6 +10507,8 @@ async function sbSyncOnLogin() {
     }
     if (sbLocalIsEmpty()) {             // fresh device / fresh browser
       sbSetStatus('Downloading your data…', 'var(--green)');
+      marks.push(Date.now());
+      sessionStorage.setItem('mf_sync_reloads', JSON.stringify(marks));
       sbApplyCloud(cloud);
       return;
     }
